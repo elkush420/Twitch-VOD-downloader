@@ -1,0 +1,11 @@
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+COPY ecs/package*.json ./
+COPY ecs/DownloadVideoTaskDefinition/download-video.js ./
+
+RUN npm install
+
+# Run the download-video
+CMD ["node", "download-video.js"]

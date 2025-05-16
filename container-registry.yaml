@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  ECRrepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  
+Outputs:
+  ECRrepoName:
+    Value: !Ref ECRrepo
+  ECRrepoRepositoryUri:
+    Value: !GetAtt ECRrepo.RepositoryUri
+  ECRrepoArn:
+    Value: !GetAtt ECRrepo.Arn

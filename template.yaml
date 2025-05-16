@@ -1,0 +1,1505 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  AmplifyAppRepoURL:
+    Type: String
+    Description: Git repository url of the amplify app # not .git
+    Default: ''
+  AmplifyAppRepoBranch:
+    Type: String
+    Description: Gitlab repository branch that the amplify app was deployed to
+    Default: 'main'
+  AmplifyAppRepoToken:
+    Type: String
+    Description: Gitlab repository token of the amplify app
+    Default: ''
+  
+  Domain:
+    Type: String
+    Description: Domain to create subdomains under
+    Default: ''
+  HostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  DomainCert:
+    Type: String
+    Description: cert of the domain in us-east-1
+    Default: ''
+  DomainPrefix:
+    Type: String
+    Description: optional sub-domain
+    Default: 'vod'
+  
+  vpcCIDR:
+    Type: String
+    Description: cidr block for the vpc (and subnets)
+    Default: 10.49.0.0/16
+  
+  ImageUri:
+    Type: String
+    Description: ECR repository uri that images are located in.
+    Default: ''
+  
+  TwitchCredentialsSecretPath:
+    Type: String
+    Default: arn:aws:secretsmanager:eu-west-2:968721831531:secret:privateTwitchCredentials-fzKx0w
+    Description: The AWS Secrets Manager Secret arn for where the twitch credentials are stored
+  
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref Domain, '']]
+      - !Not [!Equals [!Ref HostedZoneId, '']]
+      - !Not [!Equals [!Ref DomainCert, '']]
+  
+  IsSubDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref Domain, '']]
+      - !Not [!Equals [!Ref HostedZoneId, '']]
+      - !Not [!Equals [!Ref DomainCert, '']]
+      - !Not [!Equals [!Ref DomainPrefix, '']]
+  
+Globals:
+  Function:
+    MemorySize: 3008
+    Timeout: 900
+    CodeUri: ./appsync
+    Runtime: nodejs20.x
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref dataTable
+        TWITCH_CREDENTIALS_SECRET_ARN: !Ref TwitchCredentialsSecretPath
+
+Resources:
+  AmplifyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-AmplifyFunctionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-amplify-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "amplify:*"
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-secrets"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref TwitchCredentialsSecretPath
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess-Amplify"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-Step-Function-Role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-dynamo-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                Resource: !GetAtt dataTable.Arn
+        - PolicyName: !Sub "${AWS::StackName}-lambda"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-ecs"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecs:RunTask"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ecs:TagResource"
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-iam"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-dynamo-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt dataTable.Arn
+        - PolicyName: !Sub "${AWS::StackName}-secrets"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref TwitchCredentialsSecretPath
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  twitchSecretRetrieverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-twitchSecretRetrieverRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: '*'
+        - PolicyName: !Sub "${AWS::StackName}-secrets"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref TwitchCredentialsSecretPath
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  ECSTaskExecutionRole: # Role used by the container to make AWS API calls on the user's behalf
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSTaskExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  ECSTaskRole: # Role that allows containers in the make to make API requests to AWS Services
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSTaskRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-step-function-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:SendTaskSuccess"
+                  - "states:SendTaskFailure"
+                Resource:
+                  - "*"
+        - PolicyName: !Sub "${AWS::StackName}-s3-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:PutObjectTagging"
+                Resource:
+                  - !Sub "arn:aws:s3:::${videoBucket}"
+                  - !Sub "arn:aws:s3:::${videoBucket}/*"
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  StepFunctionEBRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-StepFunctionEBRuleRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-stepfunction-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "states:StartExecution"
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  dynamoStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-dynamoStoreRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  lambdaStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaStoreRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-lambdaStoreRole-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: "*"
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  APIloggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-APIloggingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs"
+        - "arn:aws:iam::aws:policy/AWSXrayFullAccess"
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-InternetGateway"
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VodVPC
+  
+  networkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VodVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-networkAcl"
+  
+  ACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: false # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  ACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: true # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  PublicSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VodVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    DependsOn:
+      - VPCGatewayAttachment
+  
+  publicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetA
+  
+  publicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetB
+  
+  publicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetC
+  
+  VodVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref vpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+  
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [0, !Cidr [!Ref vpcCIDR, 3, 8]]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref VodVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetA"
+  
+  publicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [1, !Cidr [!Ref vpcCIDR, 3, 8]]
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref VodVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetB"
+  
+  publicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [2, !Cidr [!Ref vpcCIDR, 3, 8]]
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref VodVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetC"
+  
+  ecsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-ecsSecurityGroup"
+      GroupDescription: !Sub "${AWS::StackName}-SecurityGroup description"
+      VpcId: !Ref VodVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ecsSecurityGroup"
+  
+  cluster:
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ServiceConnectDefaults:
+        Namespace: !Sub "${AWS::StackName}-cluster"
+      CapacityProviders:
+        - FARGATE
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+          ExecuteCommandConfiguration:
+            Logging: DEFAULT
+  
+  containerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/ecs/, !Ref cluster]]
+  
+  containerInsightsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/ecs/containerinsights/, !Ref cluster, '/performance']]
+  
+  ManifestTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-ManifestTaskDefinition"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      NetworkMode: awsvpc # awsvpc is required for ECS tasks on Fargate
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "4096" # 4vCPU
+      Memory: "8192" # 8 GB
+      EphemeralStorage:
+        SizeInGiB: 21 # min is 21, max is 200
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-container"
+          Image: !Sub "${ImageUri}:Manifest"
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-group: !Ref containerLogs
+              awslogs-stream-prefix: Manifest
+  
+  DownloadVideoTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-DownloadVideoTaskDefinition"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      NetworkMode: awsvpc # awsvpc is required for ECS tasks on Fargate
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "1024" # 1vCPU
+      Memory: "2048" # 2 GB
+      EphemeralStorage:
+        SizeInGiB: 21 # min is 21, max is 200
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-container"
+          Image: !Sub "${ImageUri}:DownloadVideo"
+          Essential: true
+          Environment:
+            - Name: VIDEO_BUCKET
+              Value: !Ref videoBucket
+            - Name: CLOUDFRONT_DOMAIN_NAME
+              Value: !GetAtt videoBucketDistribution.DomainName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-group: !Ref containerLogs
+              awslogs-stream-prefix: DownloadVideo
+  
+  dataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-dataTable"
+      AttributeDefinitions:
+        - AttributeName: 'pk'
+          AttributeType: 'S'
+        - AttributeName: 'sk'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'pk'
+          KeyType: 'HASH'
+        - AttributeName: 'sk'
+          KeyType: 'RANGE'
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification: 
+        Enabled: true
+        AttributeName: ttl
+  
+  ListStreamerVideos:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ListStreamerVideos"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: ListStreamerVideos.handler
+      Tracing: PassThrough
+  
+  ListStreamerVideosLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref ListStreamerVideos]]
+  
+  CreateStreamer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CreateStreamer"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: CreateStreamer.handler
+      Tracing: PassThrough
+  
+  CreateStreamerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref CreateStreamer]]
+  
+  videoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-video-bucket"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      #NotificationConfiguration: # send events to eventbridge
+      #  EventBridgeConfiguration:
+      #    EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      #VersioningConfiguration:
+      #  Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - Id: myCORSRuleId1
+            AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - '*'
+      LifecycleConfiguration:
+        Rules:
+          - Id: Archive
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 1
+                StorageClass: GLACIER_IR
+    DeletionPolicy: Delete
+  
+  videoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref videoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref videoBucket, '/*']]
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Join ['', ['arn:aws:cloudfront::', !Ref AWS::AccountId, ':distribution/', !Ref videoBucketDistribution]]
+  
+  videoBucketDistributionOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties: 
+      OriginAccessControlConfig: 
+        Name: !Sub "${AWS::StackName}-videoBucketDistribution"
+        Description: !Join ['', [!Ref AWS::StackName, '-videoBucketDistribution', 'description']]
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  
+  videoBucketDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: comment for the distribution
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${AWS::StackName}-s3Origin"
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods:
+            - HEAD
+            - GET
+            - OPTIONS
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+          # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf # Managed-CORS-S3Origin
+          # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
+          ResponseHeadersPolicyId: eaab4381-ed33-4a86-88ca-d9558dc6cd63 # CORS-with-preflight-and-SecurityHeadersPolicy
+        Enabled: TRUE
+        HttpVersion: http2and3
+        IPV6Enabled: TRUE
+        Origins:
+          - Id: !Sub "${AWS::StackName}-s3Origin"
+            DomainName: !Sub "${videoBucket}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref videoBucketDistributionOAC
+            ConnectionAttempts: 3 # number of times that cloudfront attempts to connect to the origin
+            ConnectionTimeout: 10 # number of seconds that cloudfront waits when trying to establish a connection
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        PriceClass: PriceClass_100 # PriceClass_100 - US & EU, PriceClass_200 - US & EU & Asia, PriceClass_400 - All regions
+        Staging: FALSE
+  
+  StepFunctionEBRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-StepFunction-EBRule"
+      #ScheduleExpression: cron(0/1 * * * ? *) # every minute
+      ScheduleExpression: cron(0/30 * * * ? *) # every 30 minutes
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StepFunction.Arn
+          Id: !Sub "${AWS::StackName}-StepFunction-Id"
+          RoleArn: !GetAtt StepFunctionEBRuleRole.Arn
+  
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      StateMachineName: !Sub "${AWS::StackName}-stepFunction"
+      StateMachineType: "STANDARD"
+      TracingConfiguration:
+        Enabled: true
+      Definition:
+        QueryLanguage: "JSONata"
+        #Comment: "A description of my state machine"
+        StartAt: "ListAllStreamers"
+        States:
+          ListAllStreamers:
+            Type: "Task"
+            Resource: "arn:aws:states:::aws-sdk:dynamodb:query"
+            Arguments:
+              TableName: !Ref dataTable
+              ExpressionAttributeNames:
+                "#kn0": "pk"
+                "#kn1": "sk"
+              ExpressionAttributeValues:
+                ":kv0":
+                  "S": "STREAMER"
+                ":kv1":
+                  "S": "STREAMER"
+              KeyConditionExpression: "#kn0 = :kv0 AND begins_with(#kn1, :kv1)"
+            Output:
+              Items: "{% ($unmarshall := function ($object) {($type($object) = 'array' ?[$map($object, $unmarshall)]: $merge($each($object, function ($val, $key) {{ $key: $convertValue($val) }}));)};$convertValue := function ($object) {($type := $keys($object)[0];$value := $lookup($object, $type);$type in ['S', 'SS', 'Ss', 'B', 'BS', 'Bs'] ?$value: $type in ['N'] ? $number($value): $type in ['M'] ? $unmarshall($value): $type in ['BOOL', 'Bool'] ? $value = 'true' or $value = true: $type in ['L'] ? [$map($value, $convertValue)]: $type in ['NS', 'Ns'] ? [$value.$number()]: $type in ['NULL', 'Null', 'Nul'] ? null: $error('Unsupported type: ' & $type);)};$unmarshall($states.result.Items);) %}"
+            Next: MapAllStreamers
+          MapAllStreamers:
+            Type: "Map"
+            Items: "{% $states.input.Items %}"
+            ItemProcessor:
+              StartAt: "Check for new video"
+              ProcessorConfig:
+                Mode: "INLINE"
+              States:
+                Check for new video:
+                  Type: "Task"
+                  Resource: "arn:aws:states:::lambda:invoke"
+                  Output: "{% $states.result.Payload %}"
+                  Arguments:
+                    FunctionName: !Sub "${ListStreamerVideos.Arn}:$LATEST"
+                    Payload: "{% $states.input %}"
+                  Retry:
+                    - ErrorEquals:
+                        - "Lambda.ServiceException"
+                        - "Lambda.AWSLambdaException"
+                        - "Lambda.SdkClientException"
+                        - "Lambda.TooManyRequestsException"
+                      IntervalSeconds: 1
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                      JitterStrategy: "FULL"
+                  Next: Process Streamers Videos
+                Process Streamers Videos:
+                  Type: Map
+                  End: true
+                  ItemProcessor:
+                    StartAt: Store variables
+                    ProcessorConfig:
+                      Mode: INLINE
+                    States:
+                      Store variables:
+                        Type: "Pass"
+                        Next: "Retrieve video manifest url"
+                        Assign:
+                          pk: "{% $states.input.pk %}"
+                          sk: "{% $states.input.sk %}"
+                      Handle Error:
+                        Type: "Choice"
+                        Choices:
+                          - Condition: "{% ($states.input.Error) = (\"RestrictedManifest\") %}"
+                            Next: "Restricted VOD"
+                            Comment: "If the VOD is restricted, we can't download it so don't process it."
+                        Default: "Other errors"
+                      Restricted VOD:
+                        Type: "Task"
+                        Resource: "arn:aws:states:::dynamodb:updateItem"
+                        Arguments:
+                          TableName: !Ref dataTable
+                          Key:
+                            pk:
+                              S: "{% $pk %}"
+                            sk:
+                              S: "{% $sk %}"
+                          UpdateExpression: "SET videoProcessingStatus = :newStatus"
+                          ExpressionAttributeValues:
+                            ":newStatus":
+                              S: "RESTRICTED_VOD"
+                        End: true
+                      Other errors:
+                        Type: "Task"
+                        Resource: "arn:aws:states:::dynamodb:updateItem"
+                        Arguments:
+                          TableName: !Ref dataTable
+                          Key:
+                            pk:
+                              S: "{% $pk %}"
+                            sk:
+                              S: "{% $sk %}"
+                          UpdateExpression: "SET videoProcessingStatus = :newStatus"
+                          ExpressionAttributeValues:
+                            ":newStatus":
+                              S: "FAILED"
+                        End: true
+                      Retrieve video manifest url:
+                        Type: Task
+                        Resource: arn:aws:states:::ecs:runTask.waitForTaskToken
+                        Arguments:
+                          LaunchType: FARGATE
+                          Cluster: !GetAtt cluster.Arn
+                          TaskDefinition: !Ref ManifestTaskDefinition
+                          NetworkConfiguration:
+                            AwsvpcConfiguration:
+                              Subnets:
+                                - !Ref publicSubnetA
+                                - !Ref publicSubnetB
+                                - !Ref publicSubnetC
+                              SecurityGroups:
+                                - !Ref ecsSecurityGroup
+                              AssignPublicIp: ENABLED
+                          Overrides:
+                            ContainerOverrides:
+                              - Name: !Sub "${AWS::StackName}-container"
+                                Environment:
+                                  - Name: TASK_TOKEN_ENV_VARIABLE
+                                    Value: "{% $states.context.Task.Token %}"
+                                  - Name: STATE_INPUT
+                                    Value: "{% $string($states.input) %}"
+                          Tags:
+                            - Key: userId
+                              Value: "{% $states.input.userId %}"
+                            - Key: videoId
+                              Value: "{% $states.input.videoId %}"
+                        Next: Download video
+                        Retry:
+                          - ErrorEquals:
+                              - "TimeoutManifest" # error name returned by the find-manifest task
+                            IntervalSeconds: 1
+                            MaxAttempts: 5
+                            BackoffRate: 1
+                            JitterStrategy: "FULL"
+                        Catch:
+                          - ErrorEquals:
+                              - "TimeoutManifest" # error name returned by the find-manifest task
+                              - "RestrictedManifest" # error name returned by the find-manifest task
+                            Next: "Handle Error"
+                        #End: true
+                      Download video:
+                        Type: Task
+                        Resource: arn:aws:states:::ecs:runTask.waitForTaskToken
+                        Arguments:
+                          LaunchType: FARGATE
+                          Cluster: !GetAtt cluster.Arn
+                          TaskDefinition: !Ref DownloadVideoTaskDefinition
+                          NetworkConfiguration:
+                            AwsvpcConfiguration:
+                              Subnets:
+                                - !Ref publicSubnetA
+                                - !Ref publicSubnetB
+                                - !Ref publicSubnetC
+                              SecurityGroups:
+                                - !Ref ecsSecurityGroup
+                              AssignPublicIp: ENABLED
+                          Overrides:
+                            ContainerOverrides:
+                              - Name: !Sub "${AWS::StackName}-container"
+                                Environment:
+                                  - Name: TASK_TOKEN_ENV_VARIABLE
+                                    Value: "{% $states.context.Task.Token %}"
+                                  - Name: STATE_INPUT
+                                    Value: "{% $string($states.input) %}"
+                                  - Name: VIDEO_DIRECTORY
+                                    Value: "{% $join([$states.input.userId, $states.input.videoId], '/') %}"
+                          Tags:
+                            - Key: userId
+                              Value: "{% $states.input.userId %}"
+                            - Key: videoId
+                              Value: "{% $states.input.videoId %}"
+                        Assign:
+                          twitchManifestUrl: "{% $states.result.twitchManifestUrl %}"
+                          processedManifestUri: "{% $states.result.processedManifestUri %}"
+                          processedManifestUrl: "{% $states.result.processedManifestUrl %}"
+                        Next: UpdateVideo
+                      UpdateVideo:
+                        Type: "Task"
+                        Resource: "arn:aws:states:::dynamodb:updateItem"
+                        Arguments:
+                          TableName: !Ref dataTable
+                          Key:
+                            pk:
+                              S: "{% $states.input.pk %}"
+                            sk:
+                              S: "{% $states.input.sk %}"
+                          UpdateExpression: "SET videoProcessingStatus = :newStatus, twitchManifestUrl = :twitchManifestUrl, processedManifestUri = :processedManifestUri, processedManifestUrl = :processedManifestUrl"
+                          ExpressionAttributeValues:
+                            ":newStatus":
+                              S: "COMPLETE"
+                            ":twitchManifestUrl":
+                              S: "{% $twitchManifestUrl %}"
+                            ":processedManifestUri":
+                              S: "{% $processedManifestUri %}"
+                            ":processedManifestUrl":
+                              S: "{% $processedManifestUrl %}"
+                        End: true
+            Catch:
+              - ErrorEquals:
+                - States.ALL
+                Next: "MapAllStreamers Pass"
+            End: true
+          MapAllStreamers Pass:
+            Type: "Pass"
+            End: true
+  
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-GraphQLApi"
+      ApiType: GRAPHQL
+      AuthenticationType: AWS_LAMBDA
+      LambdaAuthorizerConfig:
+        AuthorizerUri: !GetAtt GraphQLApiAuthorizer.Arn
+        AuthorizerResultTtlInSeconds: 3600
+      #AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      #UserPoolConfig:
+      #  UserPoolId: !Ref CognitoUserPool
+      #  AwsRegion: !Ref AWS::Region
+      #  DefaultAction: ALLOW
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: API_KEY
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt APIloggingRole.Arn
+        ExcludeVerboseContent: false
+        FieldLogLevel: ALL
+      Visibility: GLOBAL
+      XrayEnabled: true
+  
+  GraphQLApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/appsync/apis/', !GetAtt GraphQLApi.ApiId]]
+  
+  GraphQLApiAuthorizer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api-authorizer"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: GraphQLApiAuthorizer.handler
+  
+  GraphQLApiAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Ref GraphQLApiAuthorizer]]
+  
+  GraphQLApiAuthorizerEBPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GraphQLApiAuthorizer.Arn
+      Action: lambda:InvokeFunction
+      Principal: appsync.amazonaws.com
+      SourceArn: !Ref GraphQLApi
+  
+  GraphQLApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+  
+  GraphQLApiSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition:
+        !Sub |
+          type ListStreamerResponse @aws_lambda @aws_api_key {
+            items: [Streamer]
+            nextToken: String
+          }
+
+          type ListStreamerVideosResponse @aws_lambda @aws_api_key {
+            items: [Video]
+            nextToken: String
+          }
+
+          type Streamer @aws_lambda @aws_api_key {
+            pk: String
+            sk: String
+            userId: String
+            userName: String
+            userDisplayName: String
+            userProfileImageUrl: String
+          }
+
+          type Video @aws_lambda @aws_api_key {
+            pk: String
+            sk: String
+            videoProcessingStatus: String
+            videoPublishedTime: String
+            userId: String
+            videoId: String
+            twitchVideoUrl: String
+            twitchManifestUrl: String
+            processedManifestUrl: String
+          }
+
+          type Mutation @aws_lambda @aws_api_key {
+            createStreamer(username: String!): Streamer
+          }
+
+          type Query @aws_lambda @aws_api_key {
+            getStreamer(userId: String!): Streamer
+            listStreamers(limit: Int, nextToken: String): ListStreamerResponse
+            listStreamersVideos(userId: String!): ListStreamerVideosResponse
+          }
+  
+  # DOESNT SUPPORT CORS
+  # GraphQLApiDomain:
+  #   Type: AWS::AppSync::DomainName
+  #   Condition: IsDomainConfigured
+  #   Properties:
+  #     DomainName: !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "api-${DomainPrefix}.${Domain}", !Sub "api.${Domain}"], ""]
+  #     CertificateArn: !Ref DomainCert
+  
+  # GraphQLApiDomainAssociation:
+  #   Type: AWS::AppSync::DomainNameApiAssociation
+  #   Condition: IsDomainConfigured
+  #   Properties:
+  #     ApiId: !GetAtt GraphQLApi.ApiId
+  #     DomainName: !GetAtt GraphQLApiDomain.DomainName
+  
+  DynamoDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Name: DynamoDataSource # [_A-Za-z][_0-9A-Za-z]*
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt dynamoStoreRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref dataTable
+        AwsRegion: !Ref AWS::Region
+  
+  CreateStreamerDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Name: CreateStreamerDataSource # [_A-Za-z][_0-9A-Za-z]*
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt lambdaStoreRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt CreateStreamer.Arn
+  
+  createStreamer:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt CreateStreamerDataSource.Name
+      TypeName: Mutation
+      FieldName: createStreamer
+      Runtime:
+        Name:  APPSYNC_JS
+        RuntimeVersion: "1.0.0"
+      Code: |
+        import { util } from "@aws-appsync/utils";
+        
+        export function request(ctx) {
+          return {
+            operation: "Invoke",
+            payload: {
+              field: "createStreamer",
+              arguments: ctx.arguments,
+            },
+          };
+        }
+        
+        export function response(ctx) {
+          const { error, result } = ctx;
+          if (error) {
+            util.appendError(error.message, error.type, result);
+          }
+          return result;
+        }
+    DependsOn:
+      - GraphQLApiSchema
+  
+  listStreamers:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt DynamoDataSource.Name
+      TypeName: Query
+      FieldName: listStreamers
+      Runtime:
+        Name:  APPSYNC_JS
+        RuntimeVersion: "1.0.0"
+      Code: |
+        export function request(ctx) {
+          const { limit = 100, nextToken } = ctx.args;
+          return {
+            operation: "Query",
+            query: {
+              expression: "pk = :pk",
+              expressionValues: {
+                ":pk": { S: "STREAMER" }
+              }
+            },
+            limit,
+            nextToken
+          };
+        }
+
+        export function response(ctx) {
+          return {
+            items: ctx.result.items,
+            nextToken: ctx.result.nextToken
+          };
+        }
+    DependsOn:
+      - GraphQLApiSchema
+  
+  listStreamersVideos:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt DynamoDataSource.Name
+      TypeName: Query
+      FieldName: listStreamersVideos
+      Runtime:
+        Name:  APPSYNC_JS
+        RuntimeVersion: "1.0.0"
+      Code: |
+        export function request(ctx) {
+          const { limit = 5, nextToken, userId } = ctx.args;
+          return {
+            operation: "Query",
+            query: {
+              expression: "pk = :pk",
+              expressionValues: {
+                ":pk": { S: `VIDEO#${userId}` }
+              }
+            },
+            limit,
+            nextToken
+          };
+        }
+
+        export function response(ctx) {
+          return {
+            items: ctx.result.items,
+            nextToken: ctx.result.nextToken
+          };
+        }
+    DependsOn:
+      - GraphQLApiSchema
+  
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub "${AWS::StackName}-Amplify-app"
+      Repository: !Ref AmplifyAppRepoURL
+      AccessToken: !Ref AmplifyAppRepoToken
+      Platform: WEB_COMPUTE
+      EnableBranchAutoDeletion: true
+      IAMServiceRole: !Ref AmplifyFunctionRole
+      EnvironmentVariables:
+        - Name: twitchSecretPath
+          Value: !Ref TwitchCredentialsSecretPath
+        - Name: domain
+          Value: !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${DomainPrefix}.${Domain}", !Sub "https://${Domain}"], "http://localhost:3000"]
+        - Name: apiDomain
+          Value: !GetAtt GraphQLApi.GraphQLUrl
+      BuildSpec: !Sub |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - sudo yum install -y jq
+                - npm ci
+            build:
+              commands:
+                - secretJson=$(aws secretsmanager get-secret-value --secret-id $twitchSecretPath --query SecretString --output text)
+                - twitchClientId=$(echo $secretJson | jq -r '.clientId')
+                - twitchClientSecret=$(echo $secretJson | jq -r '.clientSecret')
+                - |
+                  cat << EOF > .env
+                  NEXT_PUBLIC_TWITCH_CLIENT_ID=$twitchClientId
+                  TWITCH_CLIENT_SECRET=$twitchClientSecret
+                  NEXT_PUBLIC_SITE_URL=$domain
+                  EOF
+                - cat .env
+                - |
+                  cat << EOF > aws-exports.js
+                  /* eslint-disable spaced-comment */
+                  /* eslint-disable quotes */
+                  /* eslint-disable quote-props */
+                  const awsExports = {
+                    "aws_project_region": "${AWS::Region}",
+                    "aws_appsync_region": "${AWS::Region}",
+                    "aws_appsync_graphqlEndpoint": "$apiDomain"
+                  };
+                  export default awsExports;
+                  EOF
+                - cat aws-exports.js
+                - rm -f .eslintrc.json
+                - npm run build
+          artifacts:
+            baseDirectory: .next
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+  
+  AmplifyAppDomain:
+    Type: AWS::Amplify::Domain
+    Condition: IsDomainConfigured
+    DependsOn:
+      - AmplifyBranch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref Domain
+      EnableAutoSubDomain: false
+      SubDomainSettings:
+        - BranchName: !Ref AmplifyAppRepoBranch
+          Prefix: !If [IsSubDomainConfigured, !Ref DomainPrefix, '']
+  
+  AmplifyAppLogGroup: #amplify would auto create this log group
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/amplify/', !GetAtt AmplifyApp.AppId]]
+  
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      BranchName: !Ref AmplifyAppRepoBranch
+      AppId: !GetAtt AmplifyApp.AppId
+      EnableAutoBuild: true
+      Stage: PRODUCTION
+  
+  # CognitoUserPool:
+  #   Type: AWS::Cognito::UserPool
+  #   Properties:
+  #     UserPoolName: !Sub "${AWS::StackName}-UserPool"
+  #     # AutoVerifiedAttributes: 
+  #     #   - preferred_username
+  #     Policies:
+  #       PasswordPolicy:
+  #         MinimumLength: 12
+  #         RequireLowercase: true
+  #         RequireUppercase: true
+  #         RequireNumbers: true
+  #     AliasAttributes:
+  #       - preferred_username
+  
+  # CognitoUserPoolClient:
+  #   Type: AWS::Cognito::UserPoolClient
+  #   DependsOn:
+  #     - CognitoTwitchIdentityProvider
+  #   Properties:
+  #     ClientName: !Sub "${AWS::StackName}-UserPoolClient"
+  #     UserPoolId: !Ref CognitoUserPool
+  #     GenerateSecret: false
+  #     AccessTokenValidity: 1
+  #     IdTokenValidity: 1
+  #     RefreshTokenValidity: 2
+  #     TokenValidityUnits:
+  #       AccessToken: hours
+  #       IdToken: hours
+  #       RefreshToken: hours
+  #     ExplicitAuthFlows:
+  #       - ALLOW_CUSTOM_AUTH
+  #       - ALLOW_USER_PASSWORD_AUTH
+  #       - ALLOW_USER_SRP_AUTH
+  #       - ALLOW_REFRESH_TOKEN_AUTH
+  #     ReadAttributes:
+  #       - email
+  #       - email_verified
+  #       - preferred_username
+  #       - name
+  #     WriteAttributes:
+  #       - email
+  #       - name
+  #       - preferred_username
+  #     ## OAuth support - hosted UI
+  #     SupportedIdentityProviders:
+  #       - Twitch
+  #     CallbackURLs:
+  #       - http://localhost:8080/api/auth/callback/cognito
+  #       - https://oauth.pstmn.io/v1/browser-callback
+  #       - http://localhost:3000
+  #       - http://localhost:3000/
+  #       - https://localhost:3000
+  #       - https://localhost:3000/
+  #       - !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${DomainPrefix}.${Domain}", !Sub "https://${Domain}"], !Ref AWS::NoValue]
+  #       - !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${DomainPrefix}.${Domain}/", !Sub "https://${Domain}/"], !Ref AWS::NoValue]
+  #     LogoutURLs:
+  #       - http://localhost:8080/api/auth/callback/cognito
+  #       - https://oauth.pstmn.io/v1/browser-callback
+  #       - http://localhost:3000
+  #       - http://localhost:3000/
+  #       - https://localhost:3000
+  #       - https://localhost:3000/
+  #       - !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${DomainPrefix}.${Domain}", !Sub "https://${Domain}"], !Ref AWS::NoValue]
+  #       - !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "https://${DomainPrefix}.${Domain}/", !Sub "https://${Domain}/"], !Ref AWS::NoValue]
+  #     AllowedOAuthScopes:
+  #       - email
+  #       - openid
+  #       - profile
+  #     AllowedOAuthFlows:
+  #       - code
+  #       - implicit
+  #     AllowedOAuthFlowsUserPoolClient: True
+  
+  # CognitoCustomDomain:
+  #   Type: AWS::Cognito::UserPoolDomain
+  #   Properties:
+  #     UserPoolId: !Ref CognitoUserPool
+  #     Domain: !If [IsDomainConfigured, !If [IsSubDomainConfigured, !Sub "auth-${DomainPrefix}.${Domain}", !Sub "auth.${Domain}"], !Ref AWS::StackName]
+  #     CustomDomainConfig:
+  #       CertificateArn: !Ref DomainCert
+  
+  # CognitoCustomDomainRecord:
+  #   Type: AWS::Route53::RecordSet
+  #   Condition: IsDomainConfigured
+  #   Properties:
+  #     Name: !Ref CognitoCustomDomain
+  #     HostedZoneId: !Ref HostedZoneId
+  #     Type: CNAME
+  #     ResourceRecords:
+  #       - !GetAtt CognitoCustomDomain.CloudFrontDistribution
+  #     TTL: 300
+  
+  # # https://dev.twitch.tv/docs/authentication/getting-tokens-oidc/#oidc-authorization-code-grant-flow
+  # # scopes - https://dev.twitch.tv/docs/authentication/scopes/
+  # CognitoTwitchIdentityProvider:
+  #   Type: AWS::Cognito::UserPoolIdentityProvider
+  #   Properties:
+  #     AttributeMapping:
+  #       username: sub
+  #       preferred_username: preferred_username
+  #     ProviderDetails:
+  #       client_id: !GetAtt twitchSecret.clientId
+  #       client_secret: !GetAtt twitchSecret.clientSecret
+  #       authorize_scopes: 'openid user:read:email'
+  #       attributes_request_method: GET
+  #       oidc_issuer: !GetAtt twitchSecret.url
+  #     ProviderName: Twitch
+  #     ProviderType: OIDC
+  #     UserPoolId: !Ref CognitoUserPool
+  
+  twitchSecretRetrieverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-twitchSecretRetrieverFunction"
+      Role: !GetAtt twitchSecretRetrieverRole.Arn
+      Handler: twitchSecretRetriever.handler
+      Tracing: PassThrough
+  
+  twitchSecretRetrieverFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref twitchSecretRetrieverFunction]]
+  
+  twitchSecret:
+    Type: Custom::twitchSecret
+    DependsOn:
+      - twitchSecretRetrieverFunctionLogGroup
+    Properties:
+      ServiceToken: !GetAtt twitchSecretRetrieverFunction.Arn
+      secretArn: !Ref TwitchCredentialsSecretPath
+  
+Outputs:
+  AmplifyAppId: # do not change name
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyAppBranchName: # do not change name
+    Value: !GetAtt AmplifyBranch.BranchName

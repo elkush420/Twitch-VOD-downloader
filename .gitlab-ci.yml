@@ -1,0 +1,104 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deployRegistry
+  - buildDockerImage
+  - deploy
+  - update-frontend
+
+variables:
+  BASE: twitch-vod-downloader
+  STACK_NAME_REGISTRY: "$BASE-registry"
+  STACK_NAME: "$BASE"
+  REGION: eu-west-2
+  REPO_ID: $CI_PROJECT_ID
+  PROD_REPO_BRANCH: main
+  REPO_TOKEN: $AMPLIFY_TOKEN # CICD token variable that allows read repository on the chosen project id
+
+deployRegistry:
+  stage: deployRegistry
+  script:
+    - sam deploy --no-fail-on-empty-changeset --template-file container-registry.yaml --stack-name $STACK_NAME_REGISTRY --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION
+
+buildDockerImage:
+  image: docker:latest
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  services:
+    - docker:20.10.16-dind
+  stage: buildDockerImage
+  before_script:
+    - apk add --no-cache aws-cli
+    - REPOSITORY_URI=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME_REGISTRY --query "Stacks[0].Outputs[?OutputKey=='ECRrepoRepositoryUri'].OutputValue" --output text)
+    - REPOSITORY_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME_REGISTRY --query "Stacks[0].Outputs[?OutputKey=='ECRrepoName'].OutputValue" --output text)
+  script:
+    - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+    # Manifest
+    - docker build -f manifest-Dockerfile -t $REPOSITORY_NAME:Manifest .
+    - docker tag $REPOSITORY_NAME:Manifest $REPOSITORY_URI:Manifest
+    - docker push $REPOSITORY_URI:Manifest
+    # Download-Video
+    - docker build -f download-Dockerfile -t $REPOSITORY_NAME:DownloadVideo .
+    - docker tag $REPOSITORY_NAME:DownloadVideo $REPOSITORY_URI:DownloadVideo
+    - docker push $REPOSITORY_URI:DownloadVideo
+
+deploy:
+  stage: deploy
+  before_script:
+    - REPOSITORY_URI=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME_REGISTRY --query "Stacks[0].Outputs[?OutputKey=='ECRrepoRepositoryUri'].OutputValue" --output text)
+    - REPOSITORY_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME_REGISTRY --query "Stacks[0].Outputs[?OutputKey=='ECRrepoName'].OutputValue" --output text)
+  script:
+    - >
+      REPO_URL=https://gitlab.com/$(curl --request GET --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID" | jq -r '.path_with_namespace')
+    - echo $REPO_URL
+    - npm ci
+    - cd appsync
+    - npm ci
+    - cd ..
+    - sam build --template template.yaml
+    - sam package --template template.yaml --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides Domain=$ROUTE_53_DOMAIN DomainCert=$ROUTE_53_DOMAIN_CERT_US_EAST_1 HostedZoneId=$ROUTE_53_DOMAIN_ID ImageUri=$REPOSITORY_URI AmplifyAppRepoURL=$REPO_URL AmplifyAppRepoToken=$REPO_TOKEN AmplifyAppRepoBranch=$PROD_REPO_BRANCH
+    # the amplify app will create a webhook that runs on every commit - we don't want that, we want to control when it runs
+    # deleting the amplify made webhook if its present.
+    - >
+      WEBHOOK_ID=$(curl --request GET --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID/hooks" | jq -r '.[0].id')
+    - >
+      if [ -n "$WEBHOOK_ID" ]; then curl --request DELETE --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID/hooks/$WEBHOOK_ID"; fi
+
+update-frontend:
+  stage: update-frontend
+  script:
+    # get the app id & branch name then telling amplify to build from most recent commit
+    - AMPLIFY_APP_ID=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
+    - AMPLIFY_BRANCH_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppBranchName'].OutputValue" --output text)
+    ###
+    - JOB_ID=$(aws amplify start-job --region $REGION --app-id ${AMPLIFY_APP_ID} --branch-name ${AMPLIFY_BRANCH_NAME} --job-type RELEASE | jq -r '.jobSummary.jobId')
+    - echo $JOB_ID
+    ##
+    - JOB_STATUS=$(aws amplify get-job --region $REGION --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.summary.status')
+    - echo $JOB_STATUS
+    ##
+    - >
+      while [[ "$JOB_STATUS" = "PENDING" || "$JOB_STATUS" = "RUNNING" ]];
+      do
+        sleep 10
+        JOB_STATUS=$(aws amplify get-job --region $REGION --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.summary.status')
+        echo $JOB_STATUS
+      done
+    - >
+      if [[ "$JOB_STATUS" = "SUCCEED" ]];
+      then
+        ARTIFACTS_URL=$(aws amplify get-job --region $REGION --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.steps[0].artifactsUrl')
+        echo $ARTIFACTS_URL
+        curl -o artifacts.zip "$ARTIFACTS_URL"
+      fi
+    - >
+      if [[ "$JOB_STATUS" = "FAILED" ]];
+      then
+        exit 1;
+      fi
+  #when: manual
+  artifacts:
+    paths:
+      - artifacts.zip
